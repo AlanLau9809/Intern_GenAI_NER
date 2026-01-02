@@ -1,0 +1,6 @@
+requests
+pypdf
+pandas
+tqdm
+sentence-transformers
+numpy
