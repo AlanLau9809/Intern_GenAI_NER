@@ -3,232 +3,211 @@ import json
 import re
 import time
 import logging
-import subprocess
-import shutil
 import argparse
-from typing import List, Dict, Any, Tuple
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Any
 
 # --- Configuration ---
-MODEL_NAME = "deepseek-r1:14b"
+MODEL_NAME = "qwen2.5:7b" 
 API_URL = "http://localhost:11434/api/generate"
-# Update this path to your actual file location
-INPUT_FILE = "/Users/chunmanchan/Downloads/Alan/CHC_Intern/NER_Proj/NER(Dec.25)/source/明英宗实录（可检索版）.pdf"
-OUTPUT_FILE = "semantic_cleaned_data.json"
 
-# Semantic Search Configuration
-# This model is excellent for Chinese/English semantic matching and runs fast on CPU
-EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
-SIMILARITY_THRESHOLD = 0.35  # 0.0 to 1.0. Lower = more loose matches. 0.35 is good for short text.
+# 請確認你的檔案路徑
+INPUT_FILE = "/Users/chunmanchan/Downloads/Alan/CHC_Intern/NER_Proj/NER(Dec.25)/source/明英宗实录（可检索版）.pdf"
+OUTPUT_FILE = "ming_shilu_ner_result.jsonl" 
+
+# 並行處理數量
+MAX_WORKERS = 3
 
 # Configure Logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("pipeline.log"),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(levelname)s - [%(threadName)s] %(message)s',
+    handlers=[logging.StreamHandler()]
 )
 
-class MingShiluExtractor:
-    def __init__(self, model_name: str, api_url: str, keyword: str = None, use_semantic: bool = False):
+class MingShiluNERPipeline:
+    def __init__(self, model_name: str, api_url: str):
         self.model_name = model_name
         self.api_url = api_url
-        self.keyword = keyword
-        self.use_semantic = use_semantic
-        self.embedding_model = None
+        self.lock = threading.Lock() 
 
-        # Lazy load embedding model only if needed
-        if self.use_semantic and self.keyword:
-            try:
-                from sentence_transformers import SentenceTransformer
-                logging.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME}...")
-                self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
-            except ImportError:
-                logging.error("sentence-transformers not installed. Run: pip install sentence-transformers")
-                raise
-
-        # System Prompt
+        # --- UPDATED PROMPT: 加入「證據歸因 (Grounding)」 ---
         self.system_prompt = """
-You are a historian specializing in the Ming Dynasty. 
-Your task is to perform Named Entity Recognition (NER) on the provided text.
+你是明朝歷史資料結構化專家。你的任務是「原樣提取」文本中的資訊。
 
-Extract the following entities into a strict JSON list format:
-1. "official_name": The name of the official.
-2. "official_rank": The title or rank.
-3. "action": Briefly describe the action or event.
-4. "time_context": Extract the year/month mentioned.
-5. "relevance": Why is this text relevant to the user's keyword?
+【嚴格限制】
+1. **只能提取**文本中「明確寫出」的內容。
+2. **禁止**使用你自己的歷史知識來補全官職或事件。
+3. 如果文本只寫了「尚書」，你就只能填「尚書」，不能自動補成「吏部尚書」。
+4. 如果文本沒提到官職，rank 必須填 null。
 
-Rules:
-- Output ONLY a valid JSON list. 
-- Handle ancient text segmentation (斷句) internally.
+【提取目標】
+請將文本中出現的每一位官員轉換為一個 JSON 對象：
+1. "name": 官員姓名。
+2. "rank": 官職。若未提及則填 null。
+3. "action": 事件摘要。
+4. "quote": **證據原文**。請直接複製文本中證明該官員和官職的那句話，不要改動任何字。
+
+【輸出規則】
+- 輸出必須是標準的 JSON List。
+- 如果無資料，回傳 []。
 """
 
-    def _filter_chunks_semantically(self, chunks: List[str]) -> List[str]:
-        """
-        Uses vector embeddings to find chunks conceptually similar to the keyword.
-        """
-        if not self.embedding_model or not self.keyword:
-            return chunks
-
-        from sentence_transformers import util
-        
-        logging.info(f"Encoding {len(chunks)} chunks for semantic search...")
-        
-        # 1. Encode the keyword
-        query_embedding = self.embedding_model.encode(self.keyword, convert_to_tensor=True)
-        
-        # 2. Encode all chunks (Batch processing)
-        chunk_embeddings = self.embedding_model.encode(chunks, convert_to_tensor=True)
-        
-        # 3. Calculate Cosine Similarity
-        # Returns a list of scores (0.0 to 1.0)
-        cosine_scores = util.cos_sim(query_embedding, chunk_embeddings)[0]
-
-        # 4. Filter
-        relevant_chunks = []
-        
-        # Combine chunk and score, then sort by score descending
-        scored_chunks = []
-        for i, score in enumerate(cosine_scores):
-            if score > SIMILARITY_THRESHOLD:
-                scored_chunks.append((score.item(), chunks[i]))
-
-        # Sort: Highest similarity first
-        scored_chunks.sort(key=lambda x: x[0], reverse=True)
-
-        logging.info(f"--- Semantic Search Results for '{self.keyword}' ---")
-        for score, chunk in scored_chunks[:5]: # Log top 5 matches
-            snippet = chunk.replace('\n', '')[:50]
-            logging.info(f"Score: {score:.4f} | Text: {snippet}...")
-
-        # Return only the text parts
-        return [item[1] for item in scored_chunks]
-
     def _clean_json_response(self, response_text: str) -> List[Dict[str, Any]]:
-        # (Same robust cleaning logic as before)
-        data = None
+        """清理 LLM 的輸出"""
         try:
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0]
+            
             data = json.loads(response_text)
-        except json.JSONDecodeError:
-            try:
-                match = re.search(r'```(?:json)?\s*(.*?)\s*```', response_text, re.DOTALL)
-                if match:
-                    data = json.loads(match.group(1))
-                else:
-                    match = re.search(r'\[.*\]', response_text, re.DOTALL)
-                    if match:
-                        data = json.loads(match.group(0))
-            except json.JSONDecodeError:
+            
+            if isinstance(data, dict): 
+                data = [data]
+            
+            if not isinstance(data, list):
                 return []
-        
-        if isinstance(data, dict): return [data]
-        if isinstance(data, list): return [item for item in data if isinstance(item, dict)]
-        return []
 
-    def query_llm(self, text_chunk: str, retries: int = 2) -> List[Dict[str, Any]]:
-        # Construct Prompt
-        prompt = f"{self.system_prompt}\n\nUser Keyword Focus: {self.keyword}\n\nInput:\n{text_chunk}\n\nOutput:"
+            valid_items = []
+            for item in data:
+                if not isinstance(item, dict): continue
+                
+                # 相容性處理
+                if 'official_name' in item and 'name' not in item:
+                    item['name'] = item.pop('official_name')
+
+                # 資料清洗：如果 quote 為空，通常代表是幻覺，標記警告
+                # 這裡我們先只保留有名字的
+                if item.get("name") and str(item.get("name")) != "[]":
+                    valid_items.append(item)
+            
+            return valid_items
+
+        except json.JSONDecodeError:
+            return []
+
+    def process_single_chunk(self, chunk_data: Dict) -> List[Dict]:
+        """Worker 函數"""
+        chunk_id = chunk_data['id']
+        text = chunk_data['text']
+        
+        full_prompt = f"{self.system_prompt}\n\n【輸入文本】:\n{text}\n\n【輸出 JSON List】:"
         
         payload = {
             "model": self.model_name,
-            "prompt": prompt,
+            "prompt": full_prompt,
             "stream": False,
             "format": "json",
-            "options": {"temperature": 0.1, "num_ctx": 4096}
+            "options": {
+                "temperature": 0.0, # 設為 0，完全禁止創造性
+                "num_ctx": 2048
+            }
         }
 
-        for attempt in range(retries):
-            try:
-                response = requests.post(self.api_url, json=payload, timeout=300)
-                response.raise_for_status()
-                return self._clean_json_response(response.json().get('response', ''))
-            except Exception as e:
-                logging.warning(f"Attempt {attempt+1} failed: {e}")
-                time.sleep(1)
-        return []
+        try:
+            response = requests.post(self.api_url, json=payload, timeout=300)
+            if response.status_code == 200:
+                raw_text = response.json().get('response', '')
+                extracted = self._clean_json_response(raw_text)
+                
+                for item in extracted:
+                    item['chunk_id'] = chunk_id
+                
+                return extracted
+            else:
+                logging.error(f"Chunk {chunk_id} API Error: {response.status_code}")
+                return []
+        except Exception as e:
+            logging.error(f"Chunk {chunk_id} Failed: {e}")
+            return []
 
-    def chunk_text(self, text: str, max_chars: int = 800) -> List[str]:
-        # Simple overlap chunking to ensure context isn't lost at cut-off points
+    def read_pdf(self, input_path: str, debug_mode: bool) -> str:
+        """讀取 PDF"""
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(input_path)
+            total_pages = len(reader.pages)
+            
+            if debug_mode:
+                logging.info(f"DEBUG 模式開啟：只處理前 10 頁 (總頁數: {total_pages})")
+                pages_to_read = reader.pages[:10]
+            else:
+                pages_to_read = reader.pages
+
+            text_content = []
+            for i, page in enumerate(pages_to_read):
+                content = page.extract_text()
+                if content:
+                    text_content.append(content)
+            
+            logging.info(f"PDF 讀取完畢，共處理 {len(pages_to_read)} 頁")
+            return "\n".join(text_content)
+        except Exception as e:
+            logging.error(f"PDF 讀取失敗: {e}")
+            return ""
+
+    def make_chunks(self, text: str, chunk_size: int = 800, overlap: int = 100) -> List[Dict]:
         chunks = []
         start = 0
-        text_len = len(text)
-        while start < text_len:
-            end = min(start + max_chars, text_len)
-            chunks.append(text[start:end])
-            start += (max_chars - 100) # 100 char overlap
+        chunk_counter = 0
+        text = text.replace("\n", "") 
+
+        while start < len(text):
+            end = min(start + chunk_size, len(text))
+            chunk_text = text[start:end]
+            chunks.append({
+                "id": chunk_counter,
+                "text": chunk_text
+            })
+            chunk_counter += 1
+            start += (chunk_size - overlap)
+            
+        logging.info(f"文本已切分為 {len(chunks)} 個區塊 (Size: {chunk_size}, Overlap: {overlap})")
         return chunks
 
-    def run(self, input_path: str, output_path: str, debug_mode: bool = False):
-        logging.info(f"Starting pipeline. Semantic Search: {self.use_semantic}")
+    def run(self, input_path: str, output_path: str, debug_mode: bool):
+        raw_text = self.read_pdf(input_path, debug_mode)
+        if not raw_text: return
         
-        # 1. Load Data
-        text = ""
-        try:
-            if input_path.lower().endswith('.pdf'):
-                import pypdf
-                reader = pypdf.PdfReader(input_path)
-                text = "\n".join([page.extract_text() or "" for page in reader.pages])
-            else:
-                with open(input_path, 'r', encoding='utf-8') as f:
-                    text = f.read()
-        except Exception as e:
-            logging.error(f"Error reading file: {e}")
-            return
-
-        # 2. Chunk Data
-        chunks = self.chunk_text(text)
-        logging.info(f"Total raw chunks: {len(chunks)}")
+        chunks = self.make_chunks(raw_text)
         
-        # 3. Semantic Filtering (The Approach A Logic)
-        if self.keyword:
-            if self.use_semantic:
-                chunks = self._filter_chunks_semantically(chunks)
-            else:
-                # Fallback to simple string matching
-                chunks = [c for c in chunks if self.keyword in c]
-            
-            logging.info(f"Chunks remaining after filtering: {len(chunks)}")
+        logging.info(f"開始並行處理 (Workers: {MAX_WORKERS})...")
+        logging.info(f"結果將即時寫入: {output_path}")
 
-        if not chunks:
-            logging.warning("No relevant chunks found. Exiting.")
-            return
-
-        if debug_mode:
-            chunks = chunks[:5]
-
-        # 4. LLM Processing
-        all_data = []
-        for i, chunk in enumerate(chunks):
-            logging.info(f"Analyzing Chunk {i+1}/{len(chunks)} with GenAI...")
-            extracted = self.query_llm(chunk)
-            if extracted:
-                for item in extracted:
-                    item['source_chunk_id'] = i
-                all_data.extend(extracted)
-
-        # 5. Save
         with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(all_data, f, ensure_ascii=False, indent=2)
-        logging.info(f"Done. Saved to {output_path}")
+            pass
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_chunk = {executor.submit(self.process_single_chunk, chunk): chunk for chunk in chunks}
+            
+            processed_count = 0
+            total_entities = 0
+
+            for future in as_completed(future_to_chunk):
+                processed_count += 1
+                result_data = future.result()
+                
+                if result_data:
+                    total_entities += len(result_data)
+                    with self.lock:
+                        with open(output_path, 'a', encoding='utf-8') as f:
+                            for item in result_data:
+                                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    
+                    first_person = result_data[0].get('name', 'Unknown')
+                    logging.info(f"[{processed_count}/{len(chunks)}] 提取 {len(result_data)} 筆 (如: {first_person})")
+                else:
+                    if processed_count % 10 == 0:
+                        logging.info(f"[{processed_count}/{len(chunks)}] 無資料或處理完畢")
+
+        logging.info(f"任務完成！共提取 {total_entities} 個實體。")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--keyword", type=str, help="Search keyword")
-    parser.add_argument("--no-semantic", action="store_true", help="Disable semantic search (use exact match only)")
+    parser.add_argument("--debug", action="store_true", help="Debug mode: Process only first 10 pages")
     args = parser.parse_args()
 
-    target_keyword = args.keyword
-    if not target_keyword:
-        target_keyword = input("Enter keyword (e.g., 地震, 兵變, 于謙): ").strip()
-
-    pipeline = MingShiluExtractor(
-        model_name=MODEL_NAME, 
-        api_url=API_URL, 
-        keyword=target_keyword,
-        use_semantic=not args.no_semantic # Default to True
-    )
-    
-    pipeline.run(INPUT_FILE, OUTPUT_FILE, debug_mode=args.debug)
+    pipeline = MingShiluNERPipeline(MODEL_NAME, API_URL)
+    pipeline.run(INPUT_FILE, OUTPUT_FILE, args.debug)
