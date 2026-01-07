@@ -11,7 +11,8 @@ from typing import List, Dict, Any
 from tqdm import tqdm
 
 # --- Configuration ---
-MODEL_NAME = "qwen2.5:3b" 
+# ollama pull qwen2.5:7b
+MODEL_NAME = "qwen2.5:7b" 
 API_URL = "http://127.0.0.1:11434/api/generate"
 
 # 請確認你的檔案路徑
@@ -19,7 +20,7 @@ INPUT_FILE = "/Users/chunmanchan/Downloads/Alan/CHC_Intern/NER_Proj/NER(Dec.25)/
 OUTPUT_FILE = "cleaned_data.json" 
 
 # 並行處理數量 
-MAX_WORKERS = 4
+MAX_WORKERS = 2
 
 # Configure Logging
 logging.basicConfig(
@@ -35,48 +36,55 @@ class MingShiluNERPipeline:
         self.lock = threading.Lock() 
 
         # --- 動態生成 Prompt ---
-        base_instruction = """
-你是明朝歷史資料結構化專家。請從《明實錄》片段中提取資訊。
+        self.system_prompt = """    
+你是明朝历史资料专家。请从《明实录》片段中提取官员资讯。
 
-【核心原則：基於證據 (Grounding)】
-1. 你的任務類似於「模版標註」，必須嚴格對應原文。
-2. **禁止幻覺**：如果原文只寫「尚書」，rank 就填「尚書」，不可補全為「吏部尚書」。
-3. **原文引述**：必須提供 quote 欄位證明你的提取是正確的。
+【核心原则：基于证据 (Grounding)】
+1. **严格对应**：资讯必须来自原文，不可编造或补全（如：原文写"尚书"不可补为"吏部尚书"）。
+2. **禁止幻觉**：如果文本没提到官职，rank 必须填 null。
+
+【重要：人名过滤规则 (Negative Constraints)】
+1. **排除非人类**：不要提取「皇太子」、「皇帝」、「上」、「百官」、「文武群臣」、「作人」、「民业」、「军官」、「边将」、「贼寇」等泛指名词或称谓。只提取有**具体姓名**的人（如：于谦、张辅）。
+2. **排除物品与地名**：不要将物品（如：珍禽异兽）或地名误认为人名。
+3. **处理并列名单**：如果原文是「太监沐敬丰城侯李贤...」，这是两个人（沐敬、李贤），**绝对不要**把他们合并成一个名字。请拆分成多个 JSON 对象。
+
+【输出栏位】
+- "_reasoning": (必要) 简短引用原文证明此人存在，并说明为何判定他是官员。
+- "name": 官员姓名 (必须是具体人名，如 "张辅"，不能是 "太师"、"皇太子"、"百官"、"作人"、"民业"等)。
+- "rank": 官职 (如 "太师"、"英国公")。
+- "action": 事件摘要。
+- "event_type": 事件分类 (Appointment/Military/Diplomacy/Disaster/Death/Other)。
+- "time": 事件时间 (如 "宣德九年")。
+
+【范例 (Few-Shot)】
+Input: "宣德九年，少师蹇义卒。"
+Output: [
+{
+"name": "蹇义",
+"rank": "少师",
+"event_type": "Death",
+"action": "去世",
+"time": "宣德九年",
+"_reasoning": "原文『少师蹇义卒』，蹇义为具体人名，提到蹇义及其官职少师，事件为去世。"
+}
+]
+
+Input: "命行在工部尚书李友直提督供应柴炭。"
+Output: [
+{
+"name": "李友直",
+"rank": "行在工部尚书",
+"event_type": "Appointment",
+"action": "提督供应柴炭",
+"time": null
+"_reasoning": "原文『命行在工部尚书李友直...』，李友直被任命提督供应柴炭。",
+}
+]
+
+【输出格式】
+只输出标准 JSON List，不要包含 Markdown 标记或其他解释。
 """
-
-        # Always use the "提取所有實體" logic
-        filter_instruction = """
-4. **提取目標**：提取文本中出現的**所有**官員及其相關事件。
-"""
-
-        task_instruction = """
-【任務一：實體提取 (NER)】
-提取所有官員的：
-- name: 姓名
-- rank: 官職 (未提及填 null)
-
-【任務二：事件分類 (Event Classification)】
-根據框架，將事件歸類為以下之一：
-- "Appointment": 人事任免 (陞、調、黜、罷)
-- "Military": 軍事衝突 (攻、戰、禦、平亂)
-- "Diplomacy": 外交朝貢 (使、貢、撫)
-- "Disaster": 災異救濟 (災、賑、免稅)
-- "Death": 官員去世 (卒、死、逝)
-- "Other": 其他
-
-【範例 (Few-Shot)】
-Input: "宣德九年，少師蹇義卒。"
-Output: [{"name": "蹇義", "rank": "少師", "event_type": "Death", "action": "去世", "quote": "少師蹇義卒", "time": "宣德九年"}]
-
-Input: "命行在工部尚書李友直提督供應柴炭。"
-Output: [{"name": "李友直", "rank": "行在工部尚書", "event_type": "Appointment", "action": "提督供應柴炭", "quote": "命行在工部尚書李友直提督供應柴炭", "time": null}]
-
-【輸出格式】
-請輸出標準 JSON List。
-"""
-        # 組合 Prompt
-        self.system_prompt = base_instruction + filter_instruction + task_instruction
-
+        
     def _clean_json_response(self, response_text: str) -> List[Dict[str, Any]]:
         """清理 LLM 的輸出"""
         try:
@@ -153,7 +161,7 @@ Output: [{"name": "李友直", "rank": "行在工部尚書", "event_type": "Appo
             "options": {
                 "temperature": 0.0, 
                 "num_ctx": 4096,      # 你的 prompt 很長，1024 很容易擠爆
-                "num_predict": 1024,   # 關鍵：限制輸出，避免卡死 (Increased from 256 to 1024)
+                "num_predict": 1024,   # Increased from 256 to 1024
             }
         }
 
@@ -202,7 +210,7 @@ Output: [{"name": "李友直", "rank": "行在工部尚書", "event_type": "Appo
             logging.error(f"PDF 讀取失敗: {e}")
             return ""
 
-    def make_chunks(self, text: str, chunk_size: int = 500, overlap: int = 50) -> List[Dict]:
+    def make_chunks(self, text: str, chunk_size: int = 500, overlap: int = 100) -> List[Dict]:
         chunks = []
         start = 0
         chunk_counter = 0
