@@ -23,7 +23,7 @@ logging.basicConfig(
 
 # --- Configuration ---
 TRAIN_DATA = "train.jsonl"
-MODEL_NAME = "Qwen/Qwen2.5-3B-Instruct"
+MODEL_NAME = "mlx-community/Qwen2.5-3B-Instruct-4bit"
 CHECKPOINT_DIR = "checkpoints"
 ADAPTER_DIR = "adapters"
 
